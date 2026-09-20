@@ -114,7 +114,10 @@ the next item, as a script, and it fails loudly on its own.
 
 1. **Read the request.** `$ARGUMENTS` is a path to a PRD or a
    description in words, optionally followed by a queue name. Read a
-   PRD file in full. Look at the project directory (the current
+   PRD file in full. When the PRD cites another file by path (a brief,
+   a header that fixes an API, a document that pins dependencies),
+   read that file too: it holds the verbatim content a scaffold script
+   or a prompt must carry. Look at the project directory (the current
    directory) enough to know what exists: build system, test framework,
    language, existing `.claude/agents`.
 2. **Decompose** into ordered items. For each feature or component:
