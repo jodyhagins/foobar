@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# A stand-in for the claude CLI so the runner can be tested offline.
+#
+# It reads the prompt from stdin and prints a stream-json event sequence
+# shaped like the real one: init, an assistant text block, a result.
+# The prompt steers it:
+#   FAKE_FAIL          -> the result is an error and the exit status is 1
+#   FAKE_SLEEP <secs>  -> sleep first (for timeout tests)
+#   FAKE_WRITE <path>  -> emit a Write tool_use event and create that file
+#                         containing the prompt's first line
+#   FAKE_SPAWN <n>     -> the result reports n spawned subagents
+#   FAKE_TRUNCATE      -> after the assistant event, write half of another
+#                         event with no newline and exit 1, as a session
+#                         killed mid-write leaves the stream
+# The response text is the prompt's first line.  The requested --model,
+# --agent and --allowedTools are echoed into the init event so tests can
+# check they were passed.
+set -eu
+model=""; agent=""; tools=""; fmt=""; agents_json="{}"; plugin_dir=""; system=""; disallowed=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --model) model="$2"; shift ;;
+        --agent) agent="$2"; shift ;;
+        --agents) agents_json="$2"; shift ;;
+        --plugin-dir) plugin_dir="$2"; shift ;;
+        --allowedTools) tools="$2"; shift ;;
+        --disallowedTools) disallowed="$2"; shift ;;
+        --output-format) fmt="$2"; shift ;;
+        --append-system-prompt) system="$2"; shift ;;
+        --max-budget-usd) shift ;;
+        *) ;;
+    esac
+    shift
+done
+prompt="$(cat)"
+first="$(printf '%s\n' "$prompt" | head -n 1)"
+sid="fake-$(date +%s)-$$"
+[ "$fmt" = "stream-json" ] || { echo "fake claude: expected --output-format stream-json" >&2; exit 2; }
+
+j() { jq -c -n "$@"; }
+j --arg sid "$sid" --arg model "$model" --arg agent "$agent" --arg tools "$tools" --arg cwd "$PWD" \
+  --argjson agents "$agents_json" --arg plugin_dir "$plugin_dir" --arg system "$system" --arg disallowed "$disallowed" \
+  '{type:"system",subtype:"init",cwd:$cwd,session_id:$sid,model:$model,claude_code_version:"0.0-fake",output_style:"default",fake:{agent:$agent,tools:$tools,agents:$agents,plugin_dir:$plugin_dir,system:$system,disallowed:$disallowed}}'
+case "$prompt" in *FAKE_SLEEP*) sleep "$(printf '%s\n' "$prompt" | sed -n 's/.*FAKE_SLEEP \([0-9]*\).*/\1/p' | head -n 1)" ;; esac
+case "$prompt" in *FAKE_WRITE*)
+    path="$(printf '%s\n' "$prompt" | sed -n 's/.*FAKE_WRITE \([^ ]*\).*/\1/p' | head -n 1)"
+    printf '%s\n' "$first" > "$path"
+    j --arg sid "$sid" --arg model "$model" --arg path "$path" --arg text "$first" \
+      '{type:"assistant",session_id:$sid,message:{model:$model,content:[{type:"tool_use",name:"Write",input:{file_path:$path,content:$text}}],usage:{input_tokens:5,output_tokens:7,cache_creation_input_tokens:100,cache_read_input_tokens:1000}}}'
+    j --arg sid "$sid" '{type:"user",session_id:$sid,message:{content:[{type:"tool_result",content:"ok"}]}}' ;;
+esac
+j --arg sid "$sid" --arg model "$model" --arg text "$first" \
+  '{type:"assistant",session_id:$sid,message:{model:$model,content:[{type:"text",text:$text}],usage:{input_tokens:10,output_tokens:20,cache_creation_input_tokens:200,cache_read_input_tokens:3000}}}'
+case "$prompt" in *FAKE_TRUNCATE*)
+    printf '{"type":"assistant","session_id":"%s","message":{"content":[{"type":"text","te' "$sid"
+    exit 1 ;;
+esac
+j --arg sid "$sid" '{type:"rate_limit_event",session_id:$sid,rate_limit_info:{unifiedWindows:{five_hour:{utilization:0.25,resetsAt:1789901400}}}}'
+case "$prompt" in
+    *FAKE_FAIL*)
+        j --arg sid "$sid" '{type:"result",subtype:"error_during_execution",is_error:true,session_id:$sid,result:"fake failure",total_cost_usd:0.001,duration_ms:5,duration_api_ms:3,num_turns:1,usage:{input_tokens:10,output_tokens:20,cache_creation_input_tokens:200,cache_read_input_tokens:3000}}'
+        exit 1 ;;
+    *)
+        spawned=0
+        case "$prompt" in *FAKE_SPAWN*) spawned="$(printf '%s\n' "$prompt" | sed -n 's/.*FAKE_SPAWN \([0-9]*\).*/\1/p' | head -n 1)" ;; esac
+        j --arg sid "$sid" --arg text "$first" --argjson spawned "$spawned" '{type:"result",subtype:"success",is_error:false,session_id:$sid,result:$text,total_cost_usd:0.0123,duration_ms:50,duration_api_ms:40,num_turns:2,subagent_stats:{spawned:$spawned},usage:{input_tokens:10,output_tokens:20,cache_creation_input_tokens:200,cache_read_input_tokens:3000}}' ;;
+esac

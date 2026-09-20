@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+# ----------------------------------------------------------------------
+# work-runner -- run a directory of work items, in order, one at a time.
+#
+# A work queue is a directory.  Each work item is a file in it whose
+# name starts with four digits; the sorted file names are the execution
+# order.  Sub-work items live in a sub-directory with the same kind of
+# name, and are run depth-first, so the whole queue is one flat sorted
+# list.  The file's extension names the node type (.md is a prompt for a
+# model, .sh is a shell script) and a YAML header at the top of the file
+# carries its properties and its current status.  The runner rewrites
+# the header as the item moves through todo -> running -> done|failed.
+#
+# See README.md next to this script for the model, and `work-runner
+# help` for the commands.
+# ----------------------------------------------------------------------
+set -euo pipefail
+
+WR_BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WR_HOME="$(cd "$WR_BIN_DIR/.." && pwd)"
+WR_LIB="$WR_HOME/lib"
+export WR_HOME WR_LIB
+
+. "$WR_LIB/common.sh"
+. "$WR_LIB/frontmatter.sh"
+
+usage() {
+    cat <<'USAGE'
+usage: work-runner <command> [options]
+
+  new <name>            create a work queue at ./.work/<timestamp>-<name>
+                        and print its path
+  run <queue> [opts]    run every item that is not done, in sorted order
+      --dry-run           validate and print the plan, run nothing
+      --retry             re-run items whose status is failed
+      --only <item>       run just that item, whatever its status
+      --augment <dir>     a directory of agents/ and skills/ that beats every
+                          other source; repeatable, first given wins
+  status <queue>        one line per item: status, type, name, title
+  reset <queue> [item...]
+                        put failed and interrupted items back to todo
+      --all               put every item back to todo
+  help                  this text
+
+Items run with the current directory as the project directory (override
+with WR_PROJECT_DIR).  A queue is a directory of NNNN-name.<ext> files;
+the extension picks the runner in lib/run-<type>.sh: md -> llm,
+sh -> shell.  Every item gets WR_WORK_DIR, WR_ITEM, WR_ITEM_FILE,
+WR_RUN_DIR, WR_BODY, WR_PROJECT_DIR and WR_ITEM_CWD in its environment.
+USAGE
+}
+
+# ---- the queue ----------------------------------------------------------
+
+# Every item in QUEUE, one relative path per line, in execution order.
+# Only files whose name starts with four digits count; hidden directories
+# (.run, .context, .git) are never entered.  A plain byte-order sort of
+# the relative paths is the whole scheduler: 0020-x/0010-y sorts after
+# 0010-z and before 0030-w, which is exactly depth-first order.
+wr_items() {
+    ( cd "$1" && find . -name '.?*' -prune -o -type f -name '[0-9][0-9][0-9][0-9]-*' -print ) \
+        | sed 's|^\./||' | LC_ALL=C sort
+}
+
+# The node type of an item: an explicit `type:` in the header, else the
+# extension.  Prints nothing for an extension nobody has a runner for.
+wr_item_type() {
+    local file="$1" type ext
+    type="$(fm_get "$file" type)"
+    if [ -z "$type" ]; then
+        ext="${file##*.}"
+        case "$ext" in
+            md) type=llm ;;
+            sh) type=shell ;;
+            *)  type="$ext" ;;
+        esac
+    fi
+    [ -x "$WR_LIB/run-$type.sh" ] || return 1
+    printf '%s\n' "$type"
+}
+
+wr_item_status() {
+    local s
+    s="$(fm_get "$1" status)"
+    printf '%s\n' "${s:-todo}"
+}
+
+# Refuse to start a run with a malformed queue.  Every problem is
+# reported, then the run is refused with status 2, so a typo is found
+# before the first item spends any money.
+wr_validate() {
+    local queue="$1" rel file problems=0 type status
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        file="$queue/$rel"
+        case "$rel" in *[[:space:]]*)
+            wr_warn "$rel: item names may not contain whitespace"; problems=$((problems + 1)); continue ;;
+        esac
+        if ! fm_has "$file"; then
+            wr_warn "$rel: no YAML header (the file must start with a --- line)"
+            problems=$((problems + 1))
+        fi
+        if ! type="$(wr_item_type "$file")"; then
+            wr_warn "$rel: no runner for this item (lib/run-<type>.sh); known types: $(ls "$WR_LIB" | sed -n 's/^run-\(.*\)\.sh$/\1/p' | tr '\n' ' ')"
+            problems=$((problems + 1))
+        fi
+        status="$(wr_item_status "$file")"
+        case "$status" in
+            todo|running|done|failed|skipped) ;;
+            *) wr_warn "$rel: unknown status '$status'"; problems=$((problems + 1)) ;;
+        esac
+    done <<< "$(wr_items "$queue")"
+    [ "$problems" -eq 0 ] || { WR_DIE_STATUS=2 wr_die "$problems problem(s) in $queue; nothing was run"; }
+}
+
+# ---- commands -----------------------------------------------------------
+
+cmd_new() {
+    local name="${1:-}" project stamp dir n
+    [ -n "$name" ] || wr_die "new: a queue name is required"
+    case "$name" in *[!A-Za-z0-9._-]*) wr_die "new: name may use letters, digits, . _ - only" ;; esac
+    project="${WR_PROJECT_DIR:-$PWD}"
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    dir="$project/.work/$stamp-$name"
+    n=1
+    while [ -e "$dir" ]; do n=$((n + 1)); dir="$project/.work/$stamp-$name-$n"; done
+    mkdir -p "$dir"
+    wr_log "created $dir"
+    printf '%s\n' "$dir"
+}
+
+cmd_status() {
+    local queue="${1:-}" rel file type status title
+    [ -d "$queue" ] || wr_die "status: not a directory: $queue"
+    printf '%-8s %-6s %-44s %s\n' STATUS TYPE ITEM TITLE
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        file="$queue/$rel"
+        type="$(wr_item_type "$file" 2>/dev/null || printf '?')"
+        status="$(wr_item_status "$file")"
+        title="$(fm_get "$file" title)"
+        printf '%-8s %-6s %-44s %s\n' "$status" "$type" "${rel%.*}" "$title"
+    done <<< "$(wr_items "$queue")"
+}
+
+cmd_reset() {
+    local queue="${1:-}" all=0 rel file status want n
+    [ -d "$queue" ] || wr_die "reset: not a directory: $queue"
+    shift
+    local -a named=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --all) all=1 ;;
+            *) named+=("$1") ;;
+        esac
+        shift
+    done
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        file="$queue/$rel"
+        status="$(wr_item_status "$file")"
+        want=0
+        if [ "$all" -eq 1 ]; then
+            want=1
+        elif [ "${#named[@]}" -gt 0 ]; then
+            for n in "${named[@]}"; do
+                [ "$n" = "$rel" ] || [ "$n" = "${rel%.*}" ] && want=1
+            done
+        else
+            case "$status" in failed|running) want=1 ;; esac
+        fi
+        [ "$want" -eq 1 ] || continue
+        fm_set "$file" status todo
+        fm_set "$file" started ""
+        fm_set "$file" finished ""
+        fm_set "$file" exit_code ""
+        wr_log "reset ${rel%.*}: $status -> todo"
+    done <<< "$(wr_items "$queue")"
+}
+
+# Run one item.  Returns the item's exit status.
+wr_run_item() {
+    local queue="$1" rel="$2" file="$queue/$2" type ext run_dir cwd rc=0
+    type="$(wr_item_type "$file")"
+    ext="${rel##*.}"
+    run_dir="$queue/.run/${rel%.*}"
+    mkdir -p "$run_dir"
+
+    cwd="$(fm_get "$file" cwd)"
+    case "$cwd" in
+        "")  cwd="$WR_PROJECT_DIR" ;;
+        /*)  ;;
+        *)   cwd="$WR_PROJECT_DIR/$cwd" ;;
+    esac
+    [ -d "$cwd" ] || wr_die "${rel%.*}: cwd does not exist: $cwd"
+
+    # The header is state; the body is the work.  Copy the body out, so
+    # what runs is exactly the file minus its header.  A body may name
+    # {{WR_WORK_DIR}}, {{WR_RUN_DIR}}, {{WR_ITEM}} or {{WR_PROJECT_DIR}}
+    # and gets the real path; that is how a prompt points a model at an
+    # earlier item's output without knowing where the queue lives.
+    fm_body "$file" \
+        | wr_fill WR_WORK_DIR "$queue" WR_RUN_DIR "$run_dir" \
+                  WR_ITEM "${rel%.*}" WR_PROJECT_DIR "$WR_PROJECT_DIR" \
+        > "$run_dir/body.$ext"
+
+    fm_set "$file" status running
+    fm_set "$file" started "$(wr_now)"
+    fm_set "$file" finished ""
+    fm_set "$file" exit_code ""
+
+    wr_log "---- ${rel%.*} ($type) $(fm_get "$file" title)"
+
+    WR_WORK_DIR="$queue" WR_ITEM="${rel%.*}" WR_ITEM_FILE="$file" \
+    WR_RUN_DIR="$run_dir" WR_BODY="$run_dir/body.$ext" WR_ITEM_CWD="$cwd" \
+    WR_ITEM_TYPE="$type" \
+        "$WR_LIB/run-$type.sh" < /dev/null || rc=$?
+
+    fm_set "$file" finished "$(wr_now)"
+    fm_set "$file" exit_code "$rc"
+    if [ "$rc" -eq 0 ]; then
+        fm_set "$file" status done
+        wr_log "done ${rel%.*}"
+    else
+        fm_set "$file" status failed
+        wr_log "FAILED ${rel%.*} (exit $rc); output is under $run_dir"
+    fi
+    return "$rc"
+}
+
+cmd_run() {
+    local queue="" dry=0 retry=0 only="" augment="" rel file status type rc
+    local n_done=0 n_skip=0 n_fail=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dry-run) dry=1 ;;
+            --retry)   retry=1 ;;
+            --only)    shift; only="${1:-}" ;;
+            --augment) shift; [ -d "${1:-}" ] || wr_die "run: --augment: not a directory: ${1:-}"
+                       augment="${augment:+$augment:}$(cd "$1" && pwd)" ;;
+            -*)        wr_die "run: unknown option $1" ;;
+            *)         queue="$1" ;;
+        esac
+        shift
+    done
+    [ -n "$queue" ] && [ -d "$queue" ] || wr_die "run: a queue directory is required"
+    queue="$(cd "$queue" && pwd)"
+    WR_PROJECT_DIR="$(cd "${WR_PROJECT_DIR:-$PWD}" && pwd)"
+    export WR_PROJECT_DIR
+    [ -n "$augment" ] && export WR_AUGMENT_DIRS="$augment"
+
+    wr_validate "$queue"
+    wr_log "queue   $queue"
+    wr_log "project $WR_PROJECT_DIR"
+
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        file="$queue/$rel"
+        status="$(wr_item_status "$file")"
+        type="$(wr_item_type "$file")"
+
+        if [ -n "$only" ]; then
+            [ "$only" = "$rel" ] || [ "$only" = "${rel%.*}" ] || continue
+        else
+            case "$status" in
+                done|skipped)
+                    n_skip=$((n_skip + 1)); continue ;;
+                failed)
+                    if [ "$retry" -eq 0 ]; then
+                        wr_die "${rel%.*} failed earlier; fix it, then 'work-runner reset' it or run with --retry"
+                    fi ;;
+                running)
+                    wr_warn "${rel%.*} was left running (interrupted?); running it again" ;;
+            esac
+        fi
+
+        if [ "$dry" -eq 1 ]; then
+            printf '%-8s %-6s %s\n' "$status" "$type" "${rel%.*}"
+            continue
+        fi
+
+        rc=0
+        wr_run_item "$queue" "$rel" || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            n_done=$((n_done + 1))
+        else
+            n_fail=$((n_fail + 1))
+            if [ "$(fm_get "$file" on_fail)" = "continue" ]; then
+                wr_warn "${rel%.*} has on_fail: continue; carrying on"
+            else
+                wr_log "stopping: $n_done done, $n_skip skipped earlier, $n_fail failed"
+                exit 1
+            fi
+        fi
+    done <<< "$(wr_items "$queue")"
+
+    [ "$dry" -eq 1 ] && exit 0
+    wr_log "finished: $n_done done, $n_skip skipped earlier, $n_fail failed"
+    [ "$n_fail" -eq 0 ]
+}
+
+# ---- dispatch -----------------------------------------------------------
+
+cmd="${1:-help}"
+[ $# -gt 0 ] && shift
+case "$cmd" in
+    new)    cmd_new "$@" ;;
+    run)    cmd_run "$@" ;;
+    status) cmd_status "$@" ;;
+    reset)  cmd_reset "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; wr_die "unknown command: $cmd" ;;
+esac
